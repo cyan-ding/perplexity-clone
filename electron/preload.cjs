@@ -1,5 +1,10 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+contextBridge.exposeInMainWorld("inquiry", {
+  loadChats: () => ipcRenderer.invoke("inquiry:load-chats"),
+  saveChats: (data) => ipcRenderer.invoke("inquiry:save-chats", data),
+});
+
 contextBridge.exposeInMainWorld("perplexity", {
   hasApiKey: () => ipcRenderer.invoke("perplexity:has-key"),
   streamChat: (body, handlers = {}) => {

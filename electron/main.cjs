@@ -1,16 +1,45 @@
 const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
 
-dotenv.config({ path: path.join(process.cwd(), ".env") });
+let API_KEY = "";
 
-const API_KEY =
-  process.env.PERPLEXITY_API_KEY ||
-  process.env.PPLX_API_KEY ||
-  process.env.PERPLEXITY_KEY ||
-  "";
+function loadApiKey() {
+  // In packaged apps, never prefer process.cwd() first — launching from Terminal or
+  // Finder can point cwd at / or a random directory and dotenv does not override by
+  // default, so a mis-ordered load can leave API_KEY empty even with Resources/.env.
+  if (app.isPackaged) {
+    const resourcesEnv = path.join(process.resourcesPath, ".env");
+    if (fs.existsSync(resourcesEnv)) {
+      dotenv.config({ path: resourcesEnv, quiet: true });
+    }
+    const userDataEnv = path.join(app.getPath("userData"), ".env");
+    if (fs.existsSync(userDataEnv)) {
+      dotenv.config({ path: userDataEnv, override: true, quiet: true });
+    }
+  } else {
+    const cwdEnv = path.join(process.cwd(), ".env");
+    if (fs.existsSync(cwdEnv)) {
+      dotenv.config({ path: cwdEnv, quiet: true });
+    }
+    const userDataEnv = path.join(app.getPath("userData"), ".env");
+    if (fs.existsSync(userDataEnv)) {
+      dotenv.config({ path: userDataEnv, override: true, quiet: true });
+    }
+  }
+
+  API_KEY =
+    process.env.PERPLEXITY_API_KEY ||
+    process.env.PPLX_API_KEY ||
+    process.env.PERPLEXITY_KEY ||
+    "";
+}
 
 function createWindow() {
+  const appPath = app.getAppPath();
+  const preload = path.join(appPath, "electron", "preload.cjs");
+
   const win = new BrowserWindow({
     width: 1100,
     height: 850,
@@ -19,10 +48,18 @@ function createWindow() {
     title: "Inquiry",
     backgroundColor: "#f3ebd9",
     webPreferences: {
-      preload: path.join(__dirname, "preload.cjs"),
+      preload,
       contextIsolation: true,
       nodeIntegration: false,
     },
+  });
+
+  win.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    console.error("Inquiry: window failed to load", errorCode, errorDescription, validatedURL);
+  });
+
+  win.webContents.on("render-process-gone", (_event, details) => {
+    console.error("Inquiry: renderer process exited", details);
   });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -33,11 +70,16 @@ function createWindow() {
   if (process.env.VITE_DEV_SERVER_URL) {
     win.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
-    win.loadFile(path.join(__dirname, "../dist/index.html"));
+    const indexHtml = path.join(appPath, "dist", "index.html");
+    if (app.isPackaged && !fs.existsSync(indexHtml)) {
+      console.error("Inquiry: missing dist — run `npm run build` before packaging.", indexHtml);
+    }
+    win.loadFile(indexHtml);
   }
 }
 
 app.whenReady().then(() => {
+  loadApiKey();
   createWindow();
 
   app.on("activate", () => {
@@ -47,6 +89,29 @@ app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+function getChatsFilePath() {
+  return path.join(app.getPath("userData"), "inquiry-chats.json");
+}
+
+ipcMain.handle("inquiry:load-chats", () => {
+  const fp = getChatsFilePath();
+  try {
+    if (!fs.existsSync(fp)) return null;
+    return JSON.parse(fs.readFileSync(fp, "utf8"));
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle("inquiry:save-chats", (_event, data) => {
+  const fp = getChatsFilePath();
+  try {
+    fs.writeFileSync(fp, JSON.stringify(data), "utf8");
+  } catch {
+    // Failed to write userData; UI still works, history may not persist.
+  }
 });
 
 ipcMain.handle("perplexity:has-key", () => Boolean(API_KEY));
@@ -82,9 +147,7 @@ ipcMain.on("perplexity:stream-chat", async (event, { requestId, body }) => {
       try {
         const parsed = JSON.parse(errText);
         if (parsed.error?.message) message = parsed.error.message;
-      } catch (error) {
-        // Keep the raw response as the error message.
-      }
+      } catch {}
       send("error", { message });
       return;
     }
@@ -114,9 +177,7 @@ ipcMain.on("perplexity:stream-chat", async (event, { requestId, body }) => {
           lastChunk = json;
           const delta = json.choices?.[0]?.delta?.content || "";
           if (delta) send("chunk", { delta });
-        } catch (error) {
-          // Ignore malformed SSE frames.
-        }
+        } catch {}
       }
     }
 

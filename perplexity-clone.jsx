@@ -5,7 +5,6 @@ import {
   Settings,
   Key,
   Loader2,
-  ExternalLink,
   Copy,
   Check,
   X,
@@ -14,8 +13,9 @@ import {
   Zap,
   Brain,
   ChevronDown,
-  DollarSign,
   AlertCircle,
+  MessageSquare,
+  Trash2,
 } from "lucide-react";
 
 // Perplexity API model catalog with pricing for cost estimation
@@ -193,12 +193,119 @@ function getElectronBridge() {
   return window.perplexity?.streamChat ? window.perplexity : null;
 }
 
+const INQUIRY_CHATS_KEY = "inquiry-chats-v1";
+
+function newThreadId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function mapActiveChats(state, mapThread) {
+  return {
+    ...state,
+    threads: state.threads.map((t) => (t.id === state.activeThreadId ? mapThread(t) : t)),
+  };
+}
+
+function titleFromQuery(q) {
+  const one = (q || "").replace(/\s+/g, " ").trim();
+  if (!one) return "New chat";
+  return one.length > 64 ? one.slice(0, 62) + "…" : one;
+}
+
+function formatChatTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  }
+  if (now - d < 6 * 24 * 60 * 60 * 1000) {
+    return d.toLocaleDateString(undefined, { weekday: "short" });
+  }
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function createInitialChats(lifetimeTotalSpent = 0) {
+  const id = newThreadId();
+  return {
+    version: 2,
+    lifetimeTotalSpent,
+    activeThreadId: id,
+    threads: [
+      {
+        id,
+        title: "New chat",
+        updatedAt: Date.now(),
+        model: "sonar",
+        contextSize: "medium",
+        totalCost: 0,
+        messages: [],
+      },
+    ],
+  };
+}
+
+function normalizeChats(data) {
+  if (!data || !Array.isArray(data.threads)) return null;
+  if (data.version != null && data.version !== 1 && data.version !== 2) return null;
+  const threads = data.threads
+    .filter((t) => t && typeof t.id === "string" && Array.isArray(t.messages))
+    .map((t) => ({
+      id: t.id,
+      title: typeof t.title === "string" ? t.title : "Chat",
+      updatedAt: typeof t.updatedAt === "number" ? t.updatedAt : Date.now(),
+      model: MODELS[t.model] ? t.model : "sonar",
+      contextSize: ["low", "medium", "high"].includes(t.contextSize) ? t.contextSize : "medium",
+      totalCost: typeof t.totalCost === "number" ? t.totalCost : 0,
+      messages: t.messages,
+    }));
+  if (!threads.length) return null;
+  const active =
+    data.activeThreadId && threads.some((x) => x.id === data.activeThreadId)
+      ? data.activeThreadId
+      : threads[0].id;
+
+  const fromThreads = threads.reduce((sum, t) => sum + (t.totalCost || 0), 0);
+  const lifetime =
+    typeof data.lifetimeTotalSpent === "number" && !Number.isNaN(data.lifetimeTotalSpent)
+      ? data.lifetimeTotalSpent
+      : fromThreads;
+
+  return { version: 2, lifetimeTotalSpent: lifetime, activeThreadId: active, threads };
+}
+
+async function readPersistedChats() {
+  if (typeof window === "undefined") return null;
+  if (window.inquiry?.loadChats) {
+    return await window.inquiry.loadChats();
+  }
+  try {
+    const r = localStorage.getItem(INQUIRY_CHATS_KEY);
+    return r ? JSON.parse(r) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writePersistedChats(data) {
+  if (typeof window === "undefined") return;
+  if (window.inquiry?.saveChats) {
+    await window.inquiry.saveChats(data);
+    return;
+  }
+  try {
+    localStorage.setItem(INQUIRY_CHATS_KEY, JSON.stringify(data));
+  } catch {
+    // quota / private mode
+  }
+}
+
 function SourceCard({ source, index }) {
   const url = source.url || source;
   let host = "";
   try {
     host = new URL(url).hostname.replace(/^www\./, "");
-  } catch (e) {
+  } catch {
     host = url;
   }
   const title = source.title || host;
@@ -268,7 +375,7 @@ function MessageBlock({ msg, onAskFollowUp }) {
       await navigator.clipboard.writeText(answer);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch (e) {}
+    } catch {}
   };
 
   return (
@@ -394,21 +501,41 @@ function MessageBlock({ msg, onAskFollowUp }) {
     </div>
   );
 }
-
 export default function PerplexityClone() {
   const [apiKey, setApiKey] = useState("");
   const [hasEnvApiKey, setHasEnvApiKey] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [model, setModel] = useState("sonar");
-  const [contextSize, setContextSize] = useState("medium");
+  const [chats, setChats] = useState(null);
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [totalCost, setTotalCost] = useState(0);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
+  const chatsRef = useRef(null);
 
-  // In Electron, the API key lives in .env and never enters renderer state.
+  useEffect(() => {
+    if (chats) chatsRef.current = chats;
+  }, [chats]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const raw = await readPersistedChats();
+      if (cancelled) return;
+      setChats(normalizeChats(raw) ?? createInitialChats());
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (chats === null) return;
+    const t = setTimeout(() => {
+      writePersistedChats(chats).catch(() => {});
+    }, 450);
+    return () => clearTimeout(t);
+  }, [chats]);
+
   useEffect(() => {
     const bridge = getElectronBridge();
     if (!bridge) {
@@ -421,6 +548,17 @@ export default function PerplexityClone() {
       setShowSettings(!hasKey);
     });
   }, []);
+
+  const activeThread =
+    chats && chats.threads.length
+      ? chats.threads.find((t) => t.id === chats.activeThreadId) || chats.threads[0]
+      : null;
+  const messages = activeThread?.messages ?? [];
+  const model = activeThread?.model ?? "sonar";
+  const contextSize = activeThread?.contextSize ?? "medium";
+  const displayCost = activeThread?.totalCost ?? 0;
+  const lifetimeTotal =
+    typeof chats?.lifetimeTotalSpent === "number" ? chats.lifetimeTotalSpent : 0;
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -441,25 +579,45 @@ export default function PerplexityClone() {
       return;
     }
 
+    const store = chatsRef.current;
+    if (!store) return;
+    const thread = store.threads.find((t) => t.id === store.activeThreadId);
+    if (!thread) return;
+
+    const model = thread.model;
+    const contextSize = thread.contextSize;
+
     setInput("");
     const userMsg = { role: "user", content: query };
-    const placeholder = {
-      role: "assistant",
-      content: "",
-      streaming: true,
-      modelLabel: MODELS[model].label,
-    };
-    const conv = [...messages, userMsg];
-    setMessages([...conv, placeholder]);
+    const conv = [...thread.messages, userMsg];
+
+    setChats((prev) =>
+      mapActiveChats(prev, (t) => {
+        const nextTitle = t.messages.length === 0 ? titleFromQuery(query) : t.title;
+        return {
+          ...t,
+          title: nextTitle,
+          updatedAt: Date.now(),
+          messages: [
+            ...t.messages,
+            userMsg,
+            {
+              role: "assistant",
+              content: "",
+              streaming: true,
+              modelLabel: MODELS[model].label,
+            },
+          ],
+        };
+      })
+    );
     setIsLoading(true);
 
-    // Build request. Deep Research doesn't accept search_context_size.
     const body = {
       model,
       messages: [
         ...conv.map(({ role, content }) => ({
           role,
-          // Strip thinking blocks from history we send back to API
           content: role === "assistant" ? splitThinking(content).answer : content,
         })),
       ],
@@ -476,12 +634,15 @@ export default function PerplexityClone() {
 
       const onDelta = (delta) => {
         acc += delta;
-        setMessages((prev) => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          next[next.length - 1] = { ...last, content: acc };
-          return next;
-        });
+        setChats((prev) =>
+          mapActiveChats(prev, (t) => {
+            const next = [...t.messages];
+            if (!next.length) return t;
+            const last = next[next.length - 1];
+            next[next.length - 1] = { ...last, content: acc };
+            return { ...t, updatedAt: Date.now(), messages: next };
+          })
+        );
       };
 
       if (bridge) {
@@ -511,7 +672,7 @@ export default function PerplexityClone() {
           try {
             const j = JSON.parse(errText);
             if (j.error?.message) errMsg = j.error.message;
-          } catch (e) {}
+          } catch {}
           throw new Error(errMsg);
         }
 
@@ -535,14 +696,11 @@ export default function PerplexityClone() {
               lastChunk = json;
               const delta = json.choices?.[0]?.delta?.content || "";
               if (delta) onDelta(delta);
-            } catch (e) {
-              // some chunks might not be JSON, ignore
-            }
+            } catch {}
           }
         }
       }
 
-      // Finalize with metadata from the last chunk
       const sources =
         lastChunk?.search_results ||
         (lastChunk?.citations?.map((url) => ({ url })) || []);
@@ -550,31 +708,45 @@ export default function PerplexityClone() {
       const usage = lastChunk?.usage;
       const cost = computeCost(model, usage, contextSize);
 
-      setMessages((prev) => {
-        const next = [...prev];
-        next[next.length - 1] = {
-          role: "assistant",
-          content: acc,
-          sources,
-          related,
-          usage,
-          cost,
-          modelLabel: MODELS[model].label,
-          streaming: false,
+      setChats((prev) => {
+        const withMessages = mapActiveChats(prev, (t) => {
+          const next = [...t.messages];
+          if (!next.length) return t;
+          next[next.length - 1] = {
+            role: "assistant",
+            content: acc,
+            sources,
+            related,
+            usage,
+            cost,
+            modelLabel: MODELS[model].label,
+            streaming: false,
+          };
+          return {
+            ...t,
+            updatedAt: Date.now(),
+            totalCost: t.totalCost + cost,
+            messages: next,
+          };
+        });
+        return {
+          ...withMessages,
+          lifetimeTotalSpent: (prev.lifetimeTotalSpent ?? 0) + cost,
         };
-        return next;
       });
-      setTotalCost((c) => c + cost);
     } catch (err) {
-      setMessages((prev) => {
-        const next = [...prev];
-        next[next.length - 1] = {
-          role: "assistant",
-          error: err.message || "Request failed",
-          streaming: false,
-        };
-        return next;
-      });
+      setChats((prev) =>
+        mapActiveChats(prev, (t) => {
+          const next = [...t.messages];
+          if (!next.length) return t;
+          next[next.length - 1] = {
+            role: "assistant",
+            error: err.message || "Request failed",
+            streaming: false,
+          };
+          return { ...t, updatedAt: Date.now(), messages: next };
+        })
+      );
     } finally {
       setIsLoading(false);
       setTimeout(() => inputRef.current?.focus(), 50);
@@ -589,18 +761,74 @@ export default function PerplexityClone() {
   };
 
   const newThread = () => {
-    setMessages([]);
+    setChats((prev) => {
+      const cur = prev.threads.find((t) => t.id === prev.activeThreadId);
+      const id = newThreadId();
+      return {
+        ...prev,
+        activeThreadId: id,
+        threads: [
+          {
+            id,
+            title: "New chat",
+            updatedAt: Date.now(),
+            model: cur?.model ?? "sonar",
+            contextSize: cur?.contextSize ?? "medium",
+            totalCost: 0,
+            messages: [],
+          },
+          ...prev.threads,
+        ],
+      };
+    });
     setInput("");
-    inputRef.current?.focus();
+    setTimeout(() => inputRef.current?.focus(), 50);
   };
+
+  const selectThread = (id) => {
+    setChats((p) => ({ ...p, activeThreadId: id }));
+    setInput("");
+  };
+
+  const deleteThread = (id) => {
+    setChats((prev) => {
+      const lifetime = prev.lifetimeTotalSpent ?? 0;
+      const remaining = prev.threads.filter((t) => t.id !== id);
+      if (remaining.length === 0) {
+        return createInitialChats(lifetime);
+      }
+      let nextActive = prev.activeThreadId;
+      if (nextActive === id) {
+        const sorted = [...remaining].sort((a, b) => b.updatedAt - a.updatedAt);
+        nextActive = sorted[0].id;
+      }
+      return { ...prev, lifetimeTotalSpent: lifetime, threads: remaining, activeThreadId: nextActive };
+    });
+  };
+
+  const sortedThreads =
+    chats && [...chats.threads].sort((a, b) => b.updatedAt - a.updatedAt);
 
   const ModelIcon = MODELS[model].icon;
   const usingElectronApi = Boolean(getElectronBridge());
   const apiKeyReady = usingElectronApi ? hasEnvApiKey : Boolean(apiKey.trim());
 
+  if (chats === null) {
+    return (
+      <div
+        className="min-h-screen w-full flex items-center justify-center"
+        style={{
+          background: "radial-gradient(ellipse at top, #faf6ee 0%, #f3ebd9 100%)",
+        }}
+      >
+        <Loader2 className="w-6 h-6 text-stone-500 animate-spin" />
+      </div>
+    );
+  }
+
   return (
     <div
-      className="min-h-screen w-full"
+      className="min-h-screen w-full flex"
       style={{
         background:
           "radial-gradient(ellipse at top, #faf6ee 0%, #f3ebd9 100%)",
@@ -612,7 +840,6 @@ export default function PerplexityClone() {
         rel="stylesheet"
       />
 
-      {/* Subtle paper grain texture */}
       <div
         className="fixed inset-0 pointer-events-none opacity-[0.04] mix-blend-multiply"
         style={{
@@ -621,33 +848,106 @@ export default function PerplexityClone() {
         }}
       />
 
-      <div className="relative max-w-3xl mx-auto px-5 sm:px-8 py-8">
-        {/* Masthead */}
-        <header className="flex items-center justify-between mb-10">
-          <div className="flex items-baseline gap-3">
-            <div
-              className="text-3xl tracking-tight text-stone-900"
-              style={{ fontFamily: "'Fraunces', serif", fontWeight: 700, fontStyle: "italic" }}
-            >
-              Inquiry
-            </div>
-            <div
-              className="text-[10px] tracking-[0.25em] uppercase text-stone-500"
-              style={{ fontFamily: "'JetBrains Mono', monospace" }}
-            >
-              · pplx ·
-            </div>
+      <aside
+        className="w-52 sm:w-60 shrink-0 border-r border-stone-200/90 bg-stone-100/40 flex flex-col h-screen min-h-0 z-10"
+        style={{ fontFamily: "'Inter', sans-serif" }}
+      >
+        <div className="p-3 border-b border-stone-200/80">
+          <div
+            className="text-lg tracking-tight text-stone-900 mb-2 px-0.5"
+            style={{ fontFamily: "'Fraunces', serif", fontWeight: 600 }}
+          >
+            Chats
           </div>
-          <div className="flex items-center gap-1">
-            {totalCost > 0 && (
+          <button
+            type="button"
+            onClick={newThread}
+            className="w-full py-2 text-[10px] tracking-[0.2em] uppercase bg-stone-900 text-amber-50 hover:bg-stone-700"
+            style={{ fontFamily: "'JetBrains Mono', monospace" }}
+          >
+            + New chat
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5 min-h-0">
+          {sortedThreads.map((t) => {
+            const active = t.id === chats.activeThreadId;
+            return (
               <div
-                className="text-[10px] tracking-[0.15em] uppercase text-amber-700 mr-2 px-2 py-1 bg-amber-50 border border-amber-200"
+                key={t.id}
+                className={`group flex items-stretch gap-0.5 rounded p-1.5 cursor-pointer ${
+                  active
+                    ? "bg-amber-100/80 border border-amber-200/60"
+                    : "hover:bg-stone-200/50 border border-transparent"
+                }`}
+                onClick={() => selectThread(t.id)}
+              >
+                <MessageSquare className="w-3.5 h-3.5 mt-0.5 shrink-0 text-stone-500" />
+                <div className="flex-1 min-w-0 pr-0.5">
+                  <div
+                    className="text-[13px] text-stone-800 truncate"
+                    style={{ fontFamily: "'Fraunces', serif" }}
+                  >
+                    {t.title}
+                  </div>
+                  <div
+                    className="text-[9px] text-stone-500 mt-0.5"
+                    style={{ fontFamily: "'JetBrains Mono', monospace" }}
+                  >
+                    {formatChatTime(t.updatedAt)}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  title="Delete"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    deleteThread(t.id);
+                  }}
+                  className="self-start p-0.5 opacity-0 group-hover:opacity-100 text-stone-400 hover:text-red-700 transition-opacity"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </aside>
+
+      <div className="flex-1 min-w-0 min-h-screen overflow-y-auto">
+        <div className="relative max-w-3xl mx-auto px-5 sm:px-8 py-8">
+          <header className="flex items-center justify-between mb-10">
+            <div className="flex items-baseline gap-3">
+              <div
+                className="text-3xl tracking-tight text-stone-900"
+                style={{ fontFamily: "'Fraunces', serif", fontWeight: 700, fontStyle: "italic" }}
+              >
+                Inquiry
+              </div>
+              <div
+                className="text-[10px] tracking-[0.25em] uppercase text-stone-500"
                 style={{ fontFamily: "'JetBrains Mono', monospace" }}
               >
-                ${totalCost.toFixed(4)}
+                · pplx ·
               </div>
-            )}
-            {messages.length > 0 && (
+            </div>
+            <div className="flex items-center gap-1">
+              {lifetimeTotal > 0 && (
+                <div
+                  className="text-right mr-2 px-2.5 py-1.5 bg-amber-50 border border-amber-200"
+                  style={{ fontFamily: "'JetBrains Mono', monospace" }}
+                  title="Cumulative cost estimates stored locally; survives deleted chats. Official billing: console.perplexity.ai"
+                >
+                  <div className="text-[9px] tracking-[0.2em] uppercase text-amber-800/80">Total (this app)</div>
+                  <div className="text-xs tabular-nums text-amber-900 font-medium">
+                    ${lifetimeTotal.toFixed(4)}
+                  </div>
+                  {displayCost > 0 && displayCost < lifetimeTotal && (
+                    <div className="text-[9px] text-amber-700/90 mt-0.5">
+                      This chat ${displayCost.toFixed(4)}
+                    </div>
+                  )}
+                </div>
+              )}
               <button
                 onClick={newThread}
                 className="text-[10px] tracking-[0.15em] uppercase text-stone-600 hover:text-stone-900 px-2 py-1 hover:bg-stone-200/50 transition-colors"
@@ -655,145 +955,151 @@ export default function PerplexityClone() {
               >
                 New
               </button>
-            )}
-            <button
-              onClick={() => setShowSettings(true)}
-              className="text-stone-500 hover:text-stone-900 p-2"
-              title="Settings"
-            >
-              <Settings className="w-4 h-4" />
-            </button>
-          </div>
-        </header>
-
-        {/* Empty state hero */}
-        {messages.length === 0 && (
-          <div className="my-12 text-center">
-            <div
-              className="text-5xl md:text-6xl text-stone-900 leading-[1.05] mb-4"
-              style={{ fontFamily: "'Fraunces', serif", fontWeight: 300 }}
-            >
-              Ask, and you shall<br />
-              <span style={{ fontStyle: "italic", fontWeight: 500 }}>
-                receive sources.
-              </span>
-            </div>
-            <p
-              className="text-stone-500 text-sm max-w-md mx-auto leading-relaxed"
-            >
-              A quiet front-end for the Perplexity API. Switch between fast search
-              and exhaustive deep research. Costs surfaced per query.
-            </p>
-
-            <div className="mt-10 flex flex-col gap-1.5 max-w-md mx-auto">
-              {[
-                "What were the major findings in the latest IPCC report?",
-                "Compare DuckDB vs ClickHouse for analytics workloads",
-                "Recent breakthroughs in room-temperature superconductors",
-              ].map((s, i) => (
-                <button
-                  key={i}
-                  onClick={() => send(s)}
-                  className="text-left px-4 py-2.5 bg-white/40 hover:bg-white border border-stone-200 hover:border-amber-300 text-stone-700 text-sm transition-all"
-                  style={{ fontFamily: "'Fraunces', serif" }}
-                >
-                  {s}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Messages */}
-        <div ref={scrollRef}>
-          {messages.map((m, i) => (
-            <MessageBlock key={i} msg={m} onAskFollowUp={(q) => send(q)} />
-          ))}
-        </div>
-
-        {/* Input dock */}
-        <div className="sticky bottom-4 mt-8">
-          <div className="bg-white border border-stone-300 shadow-[0_8px_30px_rgba(60,40,20,0.08)]">
-            {/* Model strip */}
-            <div className="flex items-center gap-1 px-2 py-2 border-b border-stone-200 overflow-x-auto">
-              {Object.values(MODELS).map((m) => {
-                const Icon = m.icon;
-                const active = model === m.id;
-                return (
-                  <button
-                    key={m.id}
-                    onClick={() => setModel(m.id)}
-                    className={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] whitespace-nowrap transition-colors ${
-                      active
-                        ? "bg-stone-900 text-amber-50"
-                        : "text-stone-600 hover:bg-stone-100"
-                    }`}
-                    style={{ fontFamily: "'JetBrains Mono', monospace" }}
-                    title={m.blurb}
-                  >
-                    <Icon className="w-3 h-3" />
-                    {m.label}
-                  </button>
-                );
-              })}
-              {MODELS[model].supportsContext && (
-                <>
-                  <div className="w-px h-4 bg-stone-300 mx-1" />
-                  <select
-                    value={contextSize}
-                    onChange={(e) => setContextSize(e.target.value)}
-                    className="text-[11px] bg-transparent text-stone-600 px-1 py-1 border-none outline-none"
-                    style={{ fontFamily: "'JetBrains Mono', monospace" }}
-                  >
-                    <option value="low">Ctx · low</option>
-                    <option value="medium">Ctx · med</option>
-                    <option value="high">Ctx · high</option>
-                  </select>
-                </>
-              )}
-            </div>
-
-            {/* Input row */}
-            <div className="flex items-end p-1">
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={
-                  model === "sonar-deep-research"
-                    ? "Ask anything — Deep Research can take a minute or two…"
-                    : "Ask anything…"
-                }
-                rows={1}
-                disabled={isLoading}
-                className="flex-1 resize-none px-3 py-2.5 bg-transparent outline-none text-stone-900 placeholder:text-stone-400 text-[15px] max-h-32"
-                style={{ fontFamily: "'Fraunces', serif" }}
-              />
               <button
-                onClick={() => send()}
-                disabled={isLoading || !input.trim()}
-                className="m-1 p-2 bg-stone-900 text-amber-50 hover:bg-stone-700 disabled:bg-stone-300 disabled:cursor-not-allowed transition-colors"
+                onClick={() => setShowSettings(true)}
+                className="text-stone-500 hover:text-stone-900 p-2"
+                title="Settings"
               >
-                {isLoading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Search className="w-4 h-4" />
-                )}
+                <Settings className="w-4 h-4" />
               </button>
             </div>
+          </header>
+
+          {messages.length === 0 && (
+            <div className="my-12 text-center">
+              <div
+                className="text-5xl md:text-6xl text-stone-900 leading-[1.05] mb-4"
+                style={{ fontFamily: "'Fraunces', serif", fontWeight: 300 }}
+              >
+                Ask, and you shall<br />
+                <span style={{ fontStyle: "italic", fontWeight: 500 }}>
+                  receive sources.
+                </span>
+              </div>
+              <p
+                className="text-stone-500 text-sm max-w-md mx-auto leading-relaxed"
+              >
+                A quiet front-end for the Perplexity API. Switch between fast search
+                and exhaustive deep research. Costs surfaced per query.
+              </p>
+
+              <div className="mt-10 flex flex-col gap-1.5 max-w-md mx-auto">
+                {[
+                  "What were the major findings in the latest IPCC report?",
+                  "Compare DuckDB vs ClickHouse for analytics workloads",
+                  "Recent breakthroughs in room-temperature superconductors",
+                ].map((s, i) => (
+                  <button
+                    key={i}
+                    onClick={() => send(s)}
+                    className="text-left px-4 py-2.5 bg-white/40 hover:bg-white border border-stone-200 hover:border-amber-300 text-stone-700 text-sm transition-all"
+                    style={{ fontFamily: "'Fraunces', serif" }}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div ref={scrollRef}>
+            {messages.map((m, i) => (
+              <MessageBlock key={i} msg={m} onAskFollowUp={(q) => send(q)} />
+            ))}
           </div>
-          <div
-            className="text-center mt-2 text-[10px] tracking-[0.15em] uppercase text-stone-400"
-            style={{ fontFamily: "'JetBrains Mono', monospace" }}
-          >
-            <ModelIcon className="w-3 h-3 inline mr-1.5 -mt-0.5" />
-            {MODELS[model].label} · {MODELS[model].blurb}
+
+          <div className="sticky bottom-4 mt-8">
+            <div className="bg-white border border-stone-300 shadow-[0_8px_30px_rgba(60,40,20,0.08)]">
+              <div className="flex items-center gap-1 px-2 py-2 border-b border-stone-200 overflow-x-auto">
+                {Object.values(MODELS).map((m) => {
+                  const Icon = m.icon;
+                  const active = model === m.id;
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() =>
+                        setChats((p) => mapActiveChats(p, (t) => ({ ...t, model: m.id, updatedAt: Date.now() })))
+                      }
+                      className={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] whitespace-nowrap transition-colors ${
+                        active
+                          ? "bg-stone-900 text-amber-50"
+                          : "text-stone-600 hover:bg-stone-100"
+                      }`}
+                      style={{ fontFamily: "'JetBrains Mono', monospace" }}
+                      title={m.blurb}
+                    >
+                      <Icon className="w-3 h-3" />
+                      {m.label}
+                    </button>
+                  );
+                })}
+                {MODELS[model].supportsContext && (
+                  <>
+                    <div className="w-px h-4 bg-stone-300 mx-1" />
+                    <select
+                      value={contextSize}
+                      onChange={(e) =>
+                        setChats((p) =>
+                          mapActiveChats(p, (t) => ({
+                            ...t,
+                            contextSize: e.target.value,
+                            updatedAt: Date.now(),
+                          }))
+                        )
+                      }
+                      className="text-[11px] bg-transparent text-stone-600 px-1 py-1 border-none outline-none"
+                      style={{ fontFamily: "'JetBrains Mono', monospace" }}
+                    >
+                      <option value="low">Ctx · low</option>
+                      <option value="medium">Ctx · med</option>
+                      <option value="high">Ctx · high</option>
+                    </select>
+                  </>
+                )}
+              </div>
+
+              <div className="flex items-end p-1">
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder={
+                    model === "sonar-deep-research"
+                      ? "Ask anything — Deep Research can take a minute or two…"
+                      : "Ask anything…"
+                  }
+                  rows={1}
+                  disabled={isLoading}
+                  className="flex-1 resize-none px-3 py-2.5 bg-transparent outline-none text-stone-900 placeholder:text-stone-400 text-[15px] max-h-32"
+                  style={{ fontFamily: "'Fraunces', serif" }}
+                />
+                <button
+                  type="button"
+                  onClick={() => send()}
+                  disabled={isLoading || !input.trim()}
+                  className="m-1 p-2 bg-stone-900 text-amber-50 hover:bg-stone-700 disabled:bg-stone-300 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isLoading ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Search className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+            <div
+              className="text-center mt-2 text-[10px] tracking-[0.15em] uppercase text-stone-400"
+              style={{ fontFamily: "'JetBrains Mono', monospace" }}
+            >
+              <ModelIcon className="w-3 h-3 inline mr-1.5 -mt-0.5" />
+              {MODELS[model].label} · {MODELS[model].blurb}
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Settings modal */}
       {showSettings && (
         <div
           className="fixed inset-0 z-50 bg-stone-950/40 flex items-center justify-center p-4"
@@ -856,7 +1162,7 @@ export default function PerplexityClone() {
                 )
               ) : (
                 <>
-                  Paste your Perplexity API key. It's kept in this session only —
+                  Paste your Perplexity API key. It&apos;s kept in this session only —
                   nothing is stored or sent anywhere except directly to{" "}
                   <code
                     className="bg-stone-200 px-1 text-[12px]"
