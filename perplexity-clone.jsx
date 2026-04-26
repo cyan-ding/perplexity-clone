@@ -91,38 +91,19 @@ function computeCost(modelId, usage, contextSize) {
   return cost;
 }
 
-// Lightweight markdown -> HTML. Handles the bits Perplexity actually returns:
-// **bold**, *italic*, `code`, [n] citation refs, ## headers, lists, paragraphs.
-// Citation refs like [1] become superscript anchors that scroll to the source list.
-function renderMarkdown(text) {
-  if (!text) return "";
-  let html = text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-
-  // Code blocks
-  html = html.replace(/```([\s\S]*?)```/g, (_, code) => {
-    return `<pre class="bg-stone-900 text-stone-100 p-4 my-3 overflow-x-auto text-[13px] leading-relaxed" style="font-family: 'JetBrains Mono', monospace;">${code.trim()}</pre>`;
-  });
-
-  // Inline code
-  html = html.replace(
+// Phrasing: inline code, then emphasis + citation refs. Table cells skip ## headers.
+function applyInlineCode(escaped) {
+  return escaped.replace(
     /`([^`]+)`/g,
     `<code class="bg-stone-200/60 px-1.5 py-0.5 text-[0.9em]" style="font-family: 'JetBrains Mono', monospace;">$1</code>`
   );
+}
 
-  // Headers
-  html = html.replace(/^### (.+)$/gm, '<h3 class="text-lg mt-5 mb-2" style="font-family: \'Fraunces\', serif; font-weight: 600;">$1</h3>');
-  html = html.replace(/^## (.+)$/gm, '<h2 class="text-xl mt-6 mb-3" style="font-family: \'Fraunces\', serif; font-weight: 600;">$1</h2>');
-  html = html.replace(/^# (.+)$/gm, '<h1 class="text-2xl mt-6 mb-3" style="font-family: \'Fraunces\', serif; font-weight: 700;">$1</h1>');
-
-  // Bold / italic
-  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
-
-  // Citation refs [1] [2,3]
-  html = html.replace(/\[(\d+(?:,\s*\d+)*)\]/g, (_, nums) => {
+function applyEmphasisAndCitations(escaped) {
+  let s = escaped;
+  s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
+  s = s.replace(/\[(\d+(?:,\s*\d+)*)\]/g, (_, nums) => {
     const list = nums.split(",").map((n) => n.trim());
     return list
       .map(
@@ -131,6 +112,146 @@ function renderMarkdown(text) {
       )
       .join("");
   });
+  return s;
+}
+
+function tableCellPhrasing(escaped) {
+  return applyEmphasisAndCitations(applyInlineCode(escaped));
+}
+
+function isTableDataRowLine(line) {
+  const t = line.replace(/\r$/, "").trim();
+  if (!t || t.startsWith("```") || t.startsWith("@@INQUIRY_CB_")) return false;
+  if (!t.includes("|")) return false;
+  return t.split("|").length >= 3;
+}
+
+function isTableSeparatorLine(line) {
+  const t = line.replace(/\r$/, "").trim();
+  if (!t.includes("|")) return false;
+  const parts = t
+    .split("|")
+    .map((p) => p.trim())
+    .filter((p) => p.length);
+  if (parts.length < 1) return false;
+  return parts.every((p) => /^:?-{2,}:?$/.test(p));
+}
+
+function parseTableRow(line) {
+  const t = line.replace(/\r$/, "").trim();
+  let s = t;
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.trim());
+}
+
+function columnAlignmentsFromSeparator(sepLine) {
+  const parts = parseTableRow(sepLine);
+  return parts.map((p) => {
+    if (/^:-+:$/.test(p)) return "text-center";
+    if (/^-+:?$/.test(p)) return "text-right";
+    return "text-left";
+  });
+}
+
+// Convert GFM-style pipe tables to HTML. Runs on escaped markdown with fenced code
+// removed (placeholders) so | inside code is not misparsed.
+function convertGfmTables(str) {
+  const lines = str.split(/\r?\n/);
+  const out = [];
+  let i = 0;
+  const tdBase = "border border-stone-200 px-3 py-2 align-top text-[0.95em] leading-[1.5]";
+
+  while (i < lines.length) {
+    if (
+      isTableDataRowLine(lines[i]) &&
+      !isTableSeparatorLine(lines[i]) &&
+      i + 1 < lines.length &&
+      isTableSeparatorLine(lines[i + 1])
+    ) {
+      const headerCells = parseTableRow(lines[i]);
+      const nCols = headerCells.length;
+      if (nCols < 1) {
+        out.push(lines[i]);
+        i++;
+        continue;
+      }
+      const aligns = columnAlignmentsFromSeparator(lines[i + 1]);
+      const bodyRows = [];
+      let j = i + 2;
+      while (j < lines.length && isTableDataRowLine(lines[j])) {
+        const cells = parseTableRow(lines[j]);
+        const padded = Array.from({ length: nCols }, (_, k) => (k < cells.length ? cells[k] : ""));
+        bodyRows.push(padded);
+        j++;
+      }
+      const alignFor = (col) => aligns[col] || "text-left";
+      const ths = headerCells
+        .map(
+          (cell, c) =>
+            `<th class="${tdBase} ${alignFor(
+              c
+            )} bg-stone-100/90 text-stone-800 font-semibold" style="font-family: 'Fraunces', serif;">${tableCellPhrasing(cell)}</th>`
+        )
+        .join("");
+      const trs = bodyRows
+        .map((row) => {
+          const tds = row
+            .map(
+              (cell, c) =>
+                `<td class="${tdBase} ${alignFor(c)} text-stone-800" style="font-family: 'Fraunces', serif;">${tableCellPhrasing(cell)}</td>`
+            )
+            .join("");
+          return `<tr>${tds}</tr>`;
+        })
+        .join("");
+      out.push(
+        `<div class="inquiry-md-table my-4 w-full max-w-full overflow-x-auto rounded-lg border border-stone-200/80">` +
+          `<table class="w-full min-w-[min(100%,520px)] border-collapse text-left text-[15px]">` +
+          `<thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table></div>`
+      );
+      i = j;
+    } else {
+      out.push(lines[i]);
+      i++;
+    }
+  }
+  return out.join("\n");
+}
+
+// Lightweight markdown -> HTML. Handles the bits Perplexity actually returns:
+// **bold**, *italic*, `code`, [n] citation refs, ## headers, lists, GFM tables, paragraphs.
+// Citation refs like [1] become superscript anchors that scroll to the source list.
+function renderMarkdown(text) {
+  if (!text) return "";
+  let html = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  // Fenced code -> placeholders (so pipe tables in answers never eat code, and line scan stays simple)
+  const codeBlocks = [];
+  html = html.replace(/```([\s\S]*?)```/g, (_, code) => {
+    const idx = codeBlocks.length;
+    const pre = `<pre class="bg-stone-900 text-stone-100 p-4 my-3 overflow-x-auto text-[13px] leading-relaxed" style="font-family: 'JetBrains Mono', monospace;">${code.trim()}</pre>`;
+    codeBlocks.push(pre);
+    return `@@INQUIRY_CB_${idx}@@`;
+  });
+
+  html = convertGfmTables(html);
+
+  for (let c = codeBlocks.length - 1; c >= 0; c--) {
+    html = html.replace(`@@INQUIRY_CB_${c}@@`, codeBlocks[c]);
+  }
+
+  html = applyInlineCode(html);
+
+  // Headers
+  html = html.replace(/^### (.+)$/gm, '<h3 class="text-lg mt-5 mb-2" style="font-family: \'Fraunces\', serif; font-weight: 600;">$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2 class="text-xl mt-6 mb-3" style="font-family: \'Fraunces\', serif; font-weight: 600;">$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1 class="text-2xl mt-6 mb-3" style="font-family: \'Fraunces\', serif; font-weight: 700;">$1</h1>');
+
+  html = applyEmphasisAndCitations(html);
 
   // Lists
   html = html.replace(/^[\-\*] (.+)$/gm, '<li class="ml-5 list-disc my-1">$1</li>');
@@ -143,7 +264,7 @@ function renderMarkdown(text) {
     .map((block) => {
       const trimmed = block.trim();
       if (!trimmed) return "";
-      if (/^<(h\d|ul|ol|li|pre|blockquote)/.test(trimmed)) return trimmed;
+      if (/^<(h\d|ul|ol|li|pre|blockquote|div class="inquiry-md-table)/.test(trimmed)) return trimmed;
       return `<p class="my-3 leading-[1.7]">${trimmed.replace(/\n/g, "<br/>")}</p>`;
     })
     .join("\n");
